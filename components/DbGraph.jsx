@@ -14,8 +14,16 @@ import {
   Alert,
   PermissionsAndroid,
   Platform,
+  Animated,
 } from 'react-native';
-import { LineChart } from 'react-native-chart-kit';
+import Svg, { 
+  Path, 
+  G, 
+  Line, 
+  Text as SvgText, 
+  Rect,
+  Circle 
+} from 'react-native-svg';
 import AudioRecord from 'react-native-audio-record';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 
@@ -41,34 +49,88 @@ const VoiceDBGraph = forwardRef(
     const [currentDB, setCurrentDB] = useState(0);
     const [darkTheme, setDarkTheme] = useState(initialDarkTheme);
     const [recordingDuration, setRecordingDuration] = useState(0);
+    const [isPaused, setIsPaused] = useState(false);
     
     const intervalRef = useRef(null);
     const startTimeRef = useRef(0);
-    const lastCurrentUpdateRef = useRef(0);
     const timeoutRef = useRef(null);
     const activeSpeechTimeRef = useRef(0);
     const audioDataRef = useRef([]);
+    const animatedValue = useRef(new Animated.Value(0)).current;
 
-    // Fixed DB offset of 50
-    const dbOffset = 50;
-
-    // Initialize audio recording
+    // Initialize audio recorder
     useEffect(() => {
-      console.log("Hello World")
       const options = {
         sampleRate: 16000,
         channels: 1,
         bitsPerSample: 16,
-        audioSource: 6,
-        wavFile: 'temp_audio.wav'
+        audioSource: 6, // MIC
+        wavFile: 'temp_recording.wav'
       };
-      
+
       AudioRecord.init(options);
-      
+
+      // Setup real-time monitoring
+      AudioRecord.on('data', data => {
+        // Convert audio buffer to decibel level
+        const buffer = new Int16Array(data);
+        const rms = calculateRMS(buffer);
+        const db = 20 * Math.log10(rms / 32767) + 90; // Convert to dB scale
+        const normalizedDB = Math.max(0, Math.min(100, db));
+        
+        setCurrentDB(normalizedDB);
+        
+        const currentTime = (Date.now() - startTimeRef.current) / 1000;
+        const newPoint = { 
+          x: currentTime, 
+          y: normalizedDB,
+          timestamp: Date.now()
+        };
+
+        setWaveformData(prev => {
+          const updated = [...prev, newPoint];
+          
+          // Keep sliding window
+          const windowStart = Math.max(0, currentTime - (duration || 30));
+          const filteredForDisplay = updated.filter(p => p.x >= windowStart);
+
+          // Calculate average excluding very low values
+          const activePoints = filteredForDisplay.filter(point => point.y >= 8);
+          
+          if (activePoints.length > 0) {
+            const sum = activePoints.reduce((acc, point) => acc + point.y, 0);
+            const avg = sum / activePoints.length;
+            setAverageDB(avg);
+          }
+
+          // Update speech time for meaningful audio
+          if (normalizedDB > 12) {
+            activeSpeechTimeRef.current += 0.1;
+            
+            if (onSpeechTimeUpdate) {
+              onSpeechTimeUpdate(activeSpeechTimeRef.current);
+            }
+          }
+
+          return filteredForDisplay;
+        });
+
+        setTime(currentTime);
+      });
+
       return () => {
         AudioRecord.stop();
       };
     }, []);
+
+    // Calculate RMS (Root Mean Square) for volume level
+    const calculateRMS = (buffer) => {
+      let sum = 0;
+      for (let i = 0; i < buffer.length; i++) {
+        sum += buffer[i] * buffer[i];
+      }
+      return Math.sqrt(sum / buffer.length);
+    };
 
     // Request microphone permission
     const requestMicrophonePermission = async () => {
@@ -90,7 +152,7 @@ const VoiceDBGraph = forwardRef(
           return false;
         }
       }
-      return true; // iOS permissions handled in Info.plist
+      return true;
     };
 
     // Expose methods to parent component
@@ -118,85 +180,94 @@ const VoiceDBGraph = forwardRef(
         setRecordingDuration(0);
         activeSpeechTimeRef.current = 0;
         audioDataRef.current = [];
+        setWaveformData([]);
         
         startTimeRef.current = Date.now();
         setRunning(true);
+        setIsPaused(false);
 
-        // Start audio recording
+        // Start recording
         AudioRecord.start();
+        console.log('Recording started');
 
-        // Set exact timeout for 5-second duration
-        if (duration === 5) {
+        // Start pulse animation
+        Animated.loop(
+          Animated.sequence([
+            Animated.timing(animatedValue, {
+              toValue: 1,
+              duration: 1000,
+              useNativeDriver: false,
+            }),
+            Animated.timing(animatedValue, {
+              toValue: 0,
+              duration: 1000,
+              useNativeDriver: false,
+            }),
+          ])
+        ).start();
+
+        // Set timeout for duration limit
+        if (duration && duration > 0) {
           if (timeoutRef.current) {
             clearTimeout(timeoutRef.current);
           }
           timeoutRef.current = setTimeout(() => {
             stopAudio();
-          }, 5000);
+          }, duration * 1000);
         }
 
         return true;
       } catch (error) {
-        console.error('Error accessing microphone:', error);
-        Alert.alert('Error', 'Unable to access microphone. Please check permissions.');
+        console.error('Error starting recording:', error);
+        Alert.alert('Error', 'Unable to start recording. Please check permissions.');
+        setRunning(false);
         return false;
       }
     };
 
-    const stopAudio = () => {
-      setRunning(false);
-      clearInterval(intervalRef.current);
+    const stopAudio = async () => {
+      try {
+        setRunning(false);
+        animatedValue.stopAnimation();
 
-      // Clear the timeout if it exists
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
+        if (timeoutRef.current) {
+          clearTimeout(timeoutRef.current);
+          timeoutRef.current = null;
+        }
+
+        // Stop recording
+        const audioFile = await AudioRecord.stop();
+        console.log('Recording stopped:', audioFile);
+
+        const finalRecordingDuration = (Date.now() - startTimeRef.current) / 1000;
+        setRecordingDuration(finalRecordingDuration);
+
+        if (onSpeechTimeUpdate) {
+          onSpeechTimeUpdate(activeSpeechTimeRef.current);
+        }
+
+        let finalAverageDB = averageDB;
+
+        if (activeSpeechTimeRef.current < 1) {
+          console.log('Active speech time less than 1 second - Setting average DB to 0');
+          finalAverageDB = 0;
+          setAverageDB(0);
+        }
+
+        console.log('Total recording duration:', finalRecordingDuration.toFixed(2), 'seconds');
+        console.log('Active speech time:', activeSpeechTimeRef.current.toFixed(2), 'seconds');
+        console.log('Average DB:', finalAverageDB.toFixed(1));
+
+        if (onAverageUpdate) {
+          onAverageUpdate(finalAverageDB);
+        }
+
+        return finalAverageDB;
+      } catch (error) {
+        console.error('Error stopping recording:', error);
+        setRunning(false);
+        return averageDB;
       }
-
-      // Stop audio recording
-      AudioRecord.stop();
-
-      // Calculate the final recording duration
-      const finalRecordingDuration = (Date.now() - startTimeRef.current) / 1000;
-      setRecordingDuration(finalRecordingDuration);
-
-      if (onSpeechTimeUpdate) {
-        onSpeechTimeUpdate(activeSpeechTimeRef.current);
-      }
-
-      // Calculate the final average dB value
-      let finalAverageDB = averageDB;
-
-      // If active speech time is less than 1 second, set average DB to 0
-      if (activeSpeechTimeRef.current < 1) {
-        console.log(
-          'Active speech time less than 1 second:',
-          activeSpeechTimeRef.current.toFixed(2),
-          's - Setting average DB to 0'
-        );
-        finalAverageDB = 0;
-        setAverageDB(0);
-      }
-
-      // Log the results
-      console.log(
-        'Total recording duration:',
-        finalRecordingDuration.toFixed(2),
-        'seconds'
-      );
-      console.log(
-        'Active speech time:',
-        activeSpeechTimeRef.current.toFixed(2),
-        'seconds'
-      );
-      console.log('Average DB:', finalAverageDB.toFixed(1));
-
-      // Call the callback if provided
-      if (onAverageUpdate) {
-        onAverageUpdate(finalAverageDB);
-      }
-
-      return finalAverageDB;
     };
 
     const clearData = () => {
@@ -208,6 +279,8 @@ const VoiceDBGraph = forwardRef(
       setAverageDB(0);
       setCurrentDB(0);
       audioDataRef.current = [];
+      animatedValue.setValue(0);
+      setIsPaused(false);
 
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
@@ -219,85 +292,9 @@ const VoiceDBGraph = forwardRef(
       setDarkTheme((prev) => !prev);
     };
 
-    // Simulate audio level processing (in real implementation, you'd process actual audio data)
-    const processAudioData = () => {
-      // Simulate getting audio amplitude data
-      // In a real implementation, you would process the actual audio buffer
-      const simulatedAmplitude = Math.random() * 0.5 + (Math.random() > 0.7 ? 0.3 : 0.1);
-      const rms = simulatedAmplitude;
-      const dB = 20 * Math.log10(rms || 0.0001);
-      
-      console.log('DB Value:', dB);
-      
-      const normalizedDB = Math.max(0, dB + 100 - dbOffset);
-      return normalizedDB;
-    };
-
-    useEffect(() => {
-      if (!running) return;
-
-      intervalRef.current = setInterval(() => {
-        if (!running) return;
-
-        // Calculate current elapsed time
-        const currentElapsedTime = (Date.now() - startTimeRef.current) / 1000;
-
-        // If we've reached the duration, stop recording
-        if (duration && currentElapsedTime >= duration) {
-          stopAudio();
-          return;
-        }
-
-        const normalizedDB = processAudioData();
-
-        const now = Date.now();
-        if (
-          !lastCurrentUpdateRef.current ||
-          now - lastCurrentUpdateRef.current > 200
-        ) {
-          setCurrentDB(normalizedDB);
-          lastCurrentUpdateRef.current = now;
-        }
-
-        setTime(currentElapsedTime);
-
-        const newPoint = { x: currentElapsedTime, y: normalizedDB };
-
-        setWaveformData((prev) => {
-          const updated = [...prev, newPoint].filter(
-            (p) => p.x >= currentElapsedTime - duration
-          );
-
-          // Calculate average dB, excluding 1-10 dB range
-          const validPoints = updated.filter(
-            (point) => point.y < 1 || point.y > 10
-          );
-          const sum = validPoints.reduce((acc, point) => acc + point.y, 0);
-          const avg = validPoints.length > 0 ? sum / validPoints.length : 0;
-          setAverageDB(avg);
-
-          // Update active speech time if we detect meaningful audio
-          if (normalizedDB > 10) {
-            activeSpeechTimeRef.current += 0.05;
-
-            if (onSpeechTimeUpdate) {
-              onSpeechTimeUpdate(activeSpeechTimeRef.current);
-            }
-          }
-
-          return updated;
-        });
-      }, 50);
-
-      return () => clearInterval(intervalRef.current);
-    }, [running, duration, onAverageUpdate, onSpeechTimeUpdate]);
-
-    // Cleanup on component unmount
+    // Cleanup
     useEffect(() => {
       return () => {
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-        }
         if (timeoutRef.current) {
           clearTimeout(timeoutRef.current);
         }
@@ -313,9 +310,13 @@ const VoiceDBGraph = forwardRef(
           textSecondary: '#9ca3af',
           button: '#4b5563',
           buttonText: '#ffffff',
-          chartColor: 'rgba(255, 255, 255, 0.1)',
-          lineColor: 'rgb(255, 0, 0)',
-      }
+          accent: '#3b82f6',
+          lineColor: '#ef4444',
+          gridColor: '#4b5563',
+          success: '#10b981',
+          warning: '#f59e0b',
+          danger: '#ef4444',
+        }
       : {
           bg: '#f7f9fc',
           cardBg: '#ffffff',
@@ -323,110 +324,225 @@ const VoiceDBGraph = forwardRef(
           textSecondary: '#6b7280',
           button: '#e5e7eb',
           buttonText: '#374151',
-          chartColor: 'rgba(0, 0, 0, 0.1)',
-          lineColor: 'rgb(255, 0, 0)',
+          accent: '#3b82f6',
+          lineColor: '#ef4444',
+          gridColor: '#e5e7eb',
+          success: '#10b981',
+          warning: '#f59e0b',
+          danger: '#ef4444',
+        };
+
+    // Custom SVG Chart Component
+    const CustomChart = () => {
+      const chartWidth = screenWidth - 64;
+      const chartHeight = height - 40;
+      const padding = { top: 20, right: 20, bottom: 30, left: 40 };
+      const graphWidth = chartWidth - padding.left - padding.right;
+      const graphHeight = chartHeight - padding.top - padding.bottom;
+
+      const maxDB = 80;
+      const timeWindow = duration || 30;
+
+      // Create smooth path from waveform data
+      const createPath = () => {
+        if (waveformData.length < 2) {
+          const y = graphHeight;
+          return `M 0 ${y} L ${graphWidth} ${y}`;
+        }
+
+        const currentTime = time;
+        const startTime = Math.max(0, currentTime - timeWindow);
+
+        let pathData = '';
+        let hasStarted = false;
+        
+        waveformData.forEach((point, index) => {
+          const x = ((point.x - startTime) / timeWindow) * graphWidth;
+          const y = graphHeight - (point.y / maxDB) * graphHeight;
+          
+          if (x >= 0 && x <= graphWidth) {
+            if (!hasStarted) {
+              pathData += `M ${Math.max(0, x)} ${y}`;
+              hasStarted = true;
+            } else {
+              pathData += ` L ${x} ${y}`;
+            }
+          }
+        });
+
+        if (!hasStarted) {
+          const y = graphHeight;
+          pathData = `M 0 ${y} L ${graphWidth} ${y}`;
+        }
+
+        return pathData;
       };
 
-    // Prepare chart data - ensure we always have at least 2 points for the chart
-    const chartLabels = [];
-    const chartDataPoints = [];
-    
-    if (waveformData.length === 0) {
-      // Show empty chart with minimal data
-      chartLabels.push('0', Math.round(duration).toString());
-      chartDataPoints.push(0, 0);
-    } else {
-      // Create labels at regular intervals
-      const maxTime = Math.max(duration, time);
-      const labelInterval = Math.max(1, Math.floor(maxTime / 10));
+      // Grid lines and labels
+      const gridElements = [];
       
-      for (let i = 0; i <= maxTime; i += labelInterval) {
-        chartLabels.push(i.toString());
-      }
-      
-      // Fill data points to match labels
-      chartDataPoints.length = chartLabels.length;
-      chartDataPoints.fill(0);
-      
-      // Map actual data points to the chart
-      waveformData.forEach(point => {
-        const labelIndex = Math.round(point.x / labelInterval);
-        if (labelIndex < chartDataPoints.length) {
-          chartDataPoints[labelIndex] = point.y;
-        }
+      // Horizontal grid lines (dB levels)
+      const dbLevels = [0, 20, 40, 60, 80];
+      dbLevels.forEach((dbValue, i) => {
+        const y = graphHeight - (dbValue / maxDB) * graphHeight;
+        
+        gridElements.push(
+          <Line
+            key={`h-${i}`}
+            x1={0}
+            y1={y}
+            x2={graphWidth}
+            y2={y}
+            stroke={themeColors.gridColor}
+            strokeWidth={dbValue === 0 ? 1 : 0.5}
+            opacity={dbValue === 0 ? 0.6 : 0.3}
+          />
+        );
+        
+        gridElements.push(
+          <SvgText
+            key={`h-label-${i}`}
+            x={-5}
+            y={y + 4}
+            fontSize="10"
+            fill={themeColors.textSecondary}
+            textAnchor="end"
+          >
+            {dbValue}
+          </SvgText>
+        );
       });
-    }
 
-    const chartData = {
-      labels: chartLabels,
-      datasets: [
-        {
-          data: chartDataPoints,
-          color: () => themeColors.lineColor,
-          strokeWidth: 1.5,
-        },
-      ],
+      // Vertical grid lines (time)
+      const timePoints = 6;
+      for (let i = 0; i <= timePoints; i++) {
+        const x = (i / timePoints) * graphWidth;
+        const timeValue = Math.max(0, time - timeWindow + (i / timePoints) * timeWindow);
+        
+        gridElements.push(
+          <Line
+            key={`v-${i}`}
+            x1={x}
+            y1={0}
+            x2={x}
+            y2={graphHeight}
+            stroke={themeColors.gridColor}
+            strokeWidth={0.5}
+            opacity={0.3}
+          />
+        );
+        
+        gridElements.push(
+          <SvgText
+            key={`v-label-${i}`}
+            x={x}
+            y={graphHeight + 15}
+            fontSize="10"
+            fill={themeColors.textSecondary}
+            textAnchor="middle"
+          >
+            {timeValue.toFixed(0)}s
+          </SvgText>
+        );
+      }
+
+      return (
+        <Svg width={chartWidth} height={chartHeight}>
+          <G x={padding.left} y={padding.top}>
+            <Rect
+              width={graphWidth}
+              height={graphHeight}
+              fill={themeColors.cardBg}
+              stroke={themeColors.gridColor}
+              strokeWidth={1}
+              opacity={0.3}
+            />
+            
+            {gridElements}
+            
+            <Path
+              d={createPath()}
+              stroke={themeColors.lineColor}
+              strokeWidth={2}
+              fill="none"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              opacity={0.9}
+            />
+            
+            {running && (
+              <>
+                <Circle
+                  cx={graphWidth - 10}
+                  cy={graphHeight - (currentDB / maxDB) * graphHeight}
+                  r={4}
+                  fill={themeColors.accent}
+                  opacity={0.8}
+                />
+                <Line
+                  x1={graphWidth - 5}
+                  y1={graphHeight - (currentDB / maxDB) * graphHeight}
+                  x2={graphWidth + 15}
+                  y2={graphHeight - (currentDB / maxDB) * graphHeight}
+                  stroke={themeColors.accent}
+                  strokeWidth={2}
+                />
+              </>
+            )}
+
+            {running && (
+              <Circle
+                cx={graphWidth - 30}
+                cy={15}
+                r={6}
+                fill={themeColors.danger}
+                opacity={animatedValue}
+              />
+            )}
+          </G>
+          
+          <SvgText
+            x={20}
+            y={15}
+            fontSize="12"
+            fill={themeColors.textSecondary}
+            fontWeight="bold"
+          >
+            dB
+          </SvgText>
+          
+          <SvgText
+            x={chartWidth - 60}
+            y={chartHeight - 5}
+            fontSize="12"
+            fill={themeColors.textSecondary}
+            fontWeight="bold"
+          >
+            Time (s)
+          </SvgText>
+        </Svg>
+      );
     };
 
-    const chartConfig = {
-      backgroundColor: 'transparent',
-      backgroundGradientFrom: 'transparent',
-      backgroundGradientTo: 'transparent',
-      decimalPlaces: 0,
-      color: (opacity = 1) => themeColors.chartColor,
-      labelColor: (opacity = 1) => `rgba(${darkTheme ? '255, 255, 255' : '17, 24, 39'}, ${opacity * 0.6})`,
-      style: {
-        borderRadius: 0,
-      },
-      propsForDots: {
-        r: '0', // Hide dots
-      },
-      propsForBackgroundLines: {
-        strokeWidth: 0.3,
-        stroke: themeColors.chartColor,
-        strokeOpacity: 0.3,
-      },
-      withHorizontalLines: true,
-      withVerticalLines: false,
-      withInnerLines: false,
-      withOuterLines: false,
-      yAxisInterval: 12, // Show y-axis labels every 12 units
-      formatYLabel: (value) => {
-        // Convert to fake display values like the web version
-        const numValue = parseFloat(value);
-        if (numValue === 0) return '0';
-        if (numValue <= 12) return '30';
-        if (numValue <= 24) return '60';
-        if (numValue <= 36) return '90';
-        return '120';
-      },
-    };
-
-    // Function to determine the color based on dB range
+    // Color functions
     const getColorForRange = (rangeIndex) => {
       switch (rangeIndex) {
         case 0:
-          return averageDB >= 0 && averageDB <= 16 ? '#eab308' : themeColors.cardBg;
+          return averageDB >= 0 && averageDB <= 25 ? themeColors.warning : themeColors.cardBg;
         case 1:
-          return averageDB >= 17 && averageDB <= 33 ? '#22c55e' : themeColors.cardBg;
+          return averageDB >= 26 && averageDB <= 50 ? themeColors.success : themeColors.cardBg;
         case 2:
-          return averageDB >= 34 && averageDB <= 50 ? '#dc2626' : themeColors.cardBg;
+          return averageDB >= 51 ? themeColors.danger : themeColors.cardBg;
         default:
           return themeColors.cardBg;
       }
     };
 
-    // Function to get text color for average DB display
     const getAverageDbColor = () => {
-      if (averageDB >= 0 && averageDB <= 15.6) return '#eab308';
-      if (averageDB >= 16 && averageDB <= 31.6) return '#22c55e';
-      if (averageDB >= 32) return '#dc2626';
-      return '#3b82f6';
-    };
-
-    // Function to convert real dB to fake display value
-    const getFakeDbValue = (realDb) => {
-      return (realDb * 2.5).toFixed(1);
+      if (averageDB >= 0 && averageDB <= 25) return themeColors.warning;
+      if (averageDB >= 26 && averageDB <= 50) return themeColors.success;
+      if (averageDB >= 51) return themeColors.danger;
+      return themeColors.accent;
     };
 
     const styles = StyleSheet.create({
@@ -436,10 +552,7 @@ const VoiceDBGraph = forwardRef(
         borderRadius: 12,
         backgroundColor: themeColors.bg,
         shadowColor: '#000',
-        shadowOffset: {
-          width: 0,
-          height: 2,
-        },
+        shadowOffset: { width: 0, height: 2 },
         shadowOpacity: 0.25,
         shadowRadius: 3.84,
         elevation: 5,
@@ -468,14 +581,18 @@ const VoiceDBGraph = forwardRef(
       },
       statCard: {
         backgroundColor: themeColors.cardBg,
-        paddingHorizontal: 8,
-        paddingVertical: 4,
+        paddingHorizontal: 12,
+        paddingVertical: 6,
         borderRadius: 8,
+        borderWidth: 1,
+        borderColor: themeColors.gridColor,
+        minWidth: 70,
       },
       statText: {
         fontSize: 12,
         color: themeColors.text,
-        fontFamily: 'monospace',
+        fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+        textAlign: 'center',
       },
       buttonContainer: {
         flexDirection: 'row',
@@ -483,29 +600,35 @@ const VoiceDBGraph = forwardRef(
         marginBottom: 16,
       },
       button: {
-        paddingHorizontal: 12,
-        paddingVertical: 8,
-        borderRadius: 6,
+        paddingHorizontal: 16,
+        paddingVertical: 12,
+        borderRadius: 8,
         alignItems: 'center',
+        justifyContent: 'center',
+        flex: 1,
+        minHeight: 44,
       },
       buttonText: {
         fontSize: 14,
         fontWeight: '600',
       },
       startButton: {
-        backgroundColor: running ? '#4b5563' : '#16a34a',
+        backgroundColor: running ? '#6b7280' : themeColors.success,
       },
       stopButton: {
-        backgroundColor: !running ? '#4b5563' : '#dc2626',
+        backgroundColor: !running ? '#6b7280' : themeColors.danger,
       },
       clearButton: {
         backgroundColor: themeColors.button,
+        borderWidth: 1,
+        borderColor: themeColors.gridColor,
       },
       chartContainer: {
-        height,
-        marginBottom: 12,
         backgroundColor: themeColors.cardBg,
         borderRadius: 8,
+        marginBottom: 12,
+        borderWidth: 1,
+        borderColor: themeColors.gridColor,
         overflow: 'hidden',
       },
       rangeContainer: {
@@ -514,13 +637,18 @@ const VoiceDBGraph = forwardRef(
       },
       rangeIndicator: {
         flex: 1,
-        padding: 8,
-        borderRadius: 4,
+        padding: 10,
+        borderRadius: 6,
         alignItems: 'center',
+        borderWidth: 1,
+        borderColor: themeColors.gridColor,
+        minHeight: 40,
+        justifyContent: 'center',
       },
       rangeText: {
-        fontSize: 12,
+        fontSize: 11,
         fontWeight: '600',
+        textAlign: 'center',
       },
     });
 
@@ -542,29 +670,34 @@ const VoiceDBGraph = forwardRef(
         <View style={styles.statsContainer}>
           <View style={styles.statCard}>
             <Text style={styles.statText}>
-              Current:{' '}
-              <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>
-                {getFakeDbValue(currentDB)}
-              </Text>{' '}
-              dB
+              Current{'\n'}
+              <Text style={{ color: themeColors.lineColor, fontWeight: 'bold' }}>
+                {currentDB.toFixed(1)}
+              </Text>{' dB'}
             </Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statText}>
-              Average:{' '}
+              Average{'\n'}
               <Text style={{ color: getAverageDbColor(), fontWeight: 'bold' }}>
-                {getFakeDbValue(averageDB)}
-              </Text>{' '}
-              dB
+                {averageDB.toFixed(1)}
+              </Text>{' dB'}
             </Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statText}>
-              Speech:{' '}
-              <Text style={{ fontWeight: 'bold' }}>
+              Speech{'\n'}
+              <Text style={{ color: themeColors.accent, fontWeight: 'bold' }}>
                 {activeSpeechTimeRef.current.toFixed(1)}
-              </Text>{' '}
-              s
+              </Text>{' s'}
+            </Text>
+          </View>
+          <View style={styles.statCard}>
+            <Text style={styles.statText}>
+              Time{'\n'}
+              <Text style={{ color: themeColors.text, fontWeight: 'bold' }}>
+                {time.toFixed(1)}
+              </Text>{' s'}
             </Text>
           </View>
         </View>
@@ -582,7 +715,7 @@ const VoiceDBGraph = forwardRef(
                   { color: running ? '#9ca3af' : '#ffffff' },
                 ]}
               >
-                Start
+                {running ? 'Recording...' : 'Start'}
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
@@ -611,85 +744,59 @@ const VoiceDBGraph = forwardRef(
         )}
 
         <View style={styles.chartContainer}>
-          <LineChart
-            data={chartData}
-            width={screenWidth - 64}
-            height={height}
-            chartConfig={chartConfig}
-            style={{
-              borderRadius: 8,
-            }}
-            withDots={false}
-            withShadow={false}
-            bezier={true}
-          />
+          <CustomChart />
         </View>
 
         <View style={styles.rangeContainer}>
           <View
             style={[
               styles.rangeIndicator,
-              {
-                backgroundColor: getColorForRange(0),
-              },
+              { backgroundColor: getColorForRange(0) },
             ]}
           >
             <Text
               style={[
                 styles.rangeText,
                 {
-                  color:
-                    averageDB >= 0 && averageDB <= 15.6
-                      ? '#ffffff'
-                      : themeColors.text,
+                  color: averageDB >= 0 && averageDB <= 25 ? '#ffffff' : themeColors.text,
                 },
               ]}
             >
-              0-39 dB
+              Quiet{'\n'}0-25 dB
             </Text>
           </View>
           <View
             style={[
               styles.rangeIndicator,
-              {
-                backgroundColor: getColorForRange(1),
-              },
+              { backgroundColor: getColorForRange(1) },
             ]}
           >
             <Text
               style={[
                 styles.rangeText,
                 {
-                  color:
-                    averageDB >= 16 && averageDB <= 31.6
-                      ? '#ffffff'
-                      : themeColors.text,
+                  color: averageDB >= 26 && averageDB <= 50 ? '#ffffff' : themeColors.text,
                 },
               ]}
             >
-              40-79 dB
+              Normal{'\n'}26-50 dB
             </Text>
           </View>
           <View
             style={[
               styles.rangeIndicator,
-              {
-                backgroundColor: getColorForRange(2),
-              },
+              { backgroundColor: getColorForRange(2) },
             ]}
           >
             <Text
               style={[
                 styles.rangeText,
                 {
-                  color:
-                    averageDB >= 32 && averageDB <= 48
-                      ? '#ffffff'
-                      : themeColors.text,
+                  color: averageDB >= 51 ? '#ffffff' : themeColors.text,
                 },
               ]}
             >
-              80-120 dB
+              Loud{'\n'}51+ dB
             </Text>
           </View>
         </View>
